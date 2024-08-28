@@ -16,12 +16,10 @@ const wc = require('./winchars.js')
 const pathReservations = require('./path-reservations.js')
 const stripAbsolutePath = require('./strip-absolute-path.js')
 const normPath = require('./normalize-windows-path.js')
-const stripSlash = require('./strip-trailing-slashes.js')
 
 const ONENTRY = Symbol('onEntry')
 const CHECKFS = Symbol('checkFs')
 const CHECKFS2 = Symbol('checkFs2')
-const PRUNECACHE = Symbol('pruneCache')
 const ISREUSABLE = Symbol('isReusable')
 const MAKEFS = Symbol('makeFs')
 const FILE = Symbol('file')
@@ -45,8 +43,6 @@ const GID = Symbol('gid')
 const CHECKED_CWD = Symbol('checkedCwd')
 const crypto = require('crypto')
 const getFlag = require('./get-write-flag.js')
-const platform = process.env.TESTING_TAR_FAKE_PLATFORM || process.platform
-const isWindows = platform === 'win32'
 
 // Unlinks on Windows are not atomic.
 //
@@ -65,7 +61,7 @@ const isWindows = platform === 'win32'
 // See: https://github.com/npm/node-tar/issues/183
 /* istanbul ignore next */
 const unlinkFile = (path, cb) => {
-  if (!isWindows)
+  if (process.platform !== 'win32')
     return fs.unlink(path, cb)
 
   const name = path + '.DELETE.' + crypto.randomBytes(16).toString('hex')
@@ -78,7 +74,7 @@ const unlinkFile = (path, cb) => {
 
 /* istanbul ignore next */
 const unlinkFileSync = path => {
-  if (!isWindows)
+  if (process.platform !== 'win32')
     return fs.unlinkSync(path)
 
   const name = path + '.DELETE.' + crypto.randomBytes(16).toString('hex')
@@ -92,31 +88,15 @@ const uint32 = (a, b, c) =>
   : b === b >>> 0 ? b
   : c
 
-// clear the cache if it's a case-insensitive unicode-squashing match.
-// we can't know if the current file system is case-sensitive or supports
-// unicode fully, so we check for similarity on the maximally compatible
-// representation.  Err on the side of pruning, since all it's doing is
-// preventing lstats, and it's not the end of the world if we get a false
-// positive.
-// Note that on windows, we always drop the entire cache whenever a
-// symbolic link is encountered, because 8.3 filenames are impossible
-// to reason about, and collisions are hazards rather than just failures.
-const cacheKeyNormalize = path => stripSlash(normPath(path))
-  .normalize('NFKD')
-  .toLowerCase()
-
 const pruneCache = (cache, abs) => {
-  abs = cacheKeyNormalize(abs)
+  // clear the cache if it's a case-insensitive match, since we can't
+  // know if the current file system is case-sensitive or not.
+  abs = normPath(abs).toLowerCase()
   for (const path of cache.keys()) {
-    const pnorm = cacheKeyNormalize(path)
-    if (pnorm === abs || pnorm.indexOf(abs + '/') === 0)
+    const plower = path.toLowerCase()
+    if (plower === abs || plower.toLowerCase().indexOf(abs + '/') === 0)
       cache.delete(path)
   }
-}
-
-const dropCache = cache => {
-  for (const key of cache.keys())
-    cache.delete(key)
 }
 
 class Unpack extends Parser {
@@ -178,7 +158,7 @@ class Unpack extends Parser {
     this.forceChown = opt.forceChown === true
 
     // turn ><?| in filenames into 0xf000-higher encoded forms
-    this.win32 = !!opt.win32 || isWindows
+    this.win32 = !!opt.win32 || process.platform === 'win32'
 
     // do not unpack over files that are newer than what's in the archive
     this.newer = !!opt.newer
@@ -515,7 +495,7 @@ class Unpack extends Parser {
       !this.unlink &&
       st.isFile() &&
       st.nlink <= 1 &&
-      !isWindows
+      process.platform !== 'win32'
   }
 
   // check if a thing is there, and if so, try to clobber it
@@ -527,30 +507,13 @@ class Unpack extends Parser {
     this.reservations.reserve(paths, done => this[CHECKFS2](entry, done))
   }
 
-  [PRUNECACHE] (entry) {
+  [CHECKFS2] (entry, done) {
     // if we are not creating a directory, and the path is in the dirCache,
     // then that means we are about to delete the directory we created
     // previously, and it is no longer going to be a directory, and neither
     // is any of its children.
-    // If a symbolic link is encountered on Windows, all bets are off.
-    // There is no reasonable way to sanitize the cache in such a way
-    // we will be able to avoid having filesystem collisions.  If this
-    // happens with a non-symlink entry, it'll just fail to unpack,
-    // but a symlink to a directory, using an 8.3 shortname, can evade
-    // detection and lead to arbitrary writes to anywhere on the system.
-    if (isWindows && entry.type === 'SymbolicLink')
-      dropCache(this.dirCache)
-    else if (entry.type !== 'Directory')
+    if (entry.type !== 'Directory')
       pruneCache(this.dirCache, entry.absolute)
-  }
-
-  [CHECKFS2] (entry, fullyDone) {
-    this[PRUNECACHE](entry)
-
-    const done = er => {
-      this[PRUNECACHE](entry)
-      fullyDone(er)
-    }
 
     const checkCwd = () => {
       this[MKDIR](this.cwd, this.dmode, er => {
@@ -601,13 +564,7 @@ class Unpack extends Parser {
               return afterChmod()
             return fs.chmod(entry.absolute, entry.mode, afterChmod)
           }
-          // Not a dir entry, have to remove it.
-          // NB: the only way to end up with an entry that is the cwd
-          // itself, in such a way that == does not detect, is a
-          // tricky windows absolute path with UNC or 8.3 parts (and
-          // preservePaths:true, or else it will have been stripped).
-          // In that case, the user has opted out of path protections
-          // explicitly, so if they blow away the cwd, c'est la vie.
+          // not a dir entry, have to remove it.
           if (entry.absolute !== this.cwd) {
             return fs.rmdir(entry.absolute, er =>
               this[MAKEFS](er, entry, done))
@@ -682,7 +639,8 @@ class UnpackSync extends Unpack {
   }
 
   [CHECKFS] (entry) {
-    this[PRUNECACHE](entry)
+    if (entry.type !== 'Directory')
+      pruneCache(this.dirCache, entry.absolute)
 
     if (!this[CHECKED_CWD]) {
       const er = this[MKDIR](this.cwd, this.dmode)
@@ -731,7 +689,7 @@ class UnpackSync extends Unpack {
     this[MAKEFS](er, entry)
   }
 
-  [FILE] (entry, done) {
+  [FILE] (entry, _) {
     const mode = entry.mode & 0o7777 || this.fmode
 
     const oner = er => {
@@ -743,7 +701,6 @@ class UnpackSync extends Unpack {
       }
       if (er || closeError)
         this[ONERROR](er || closeError, entry)
-      done()
     }
 
     let fd
@@ -803,14 +760,11 @@ class UnpackSync extends Unpack {
     })
   }
 
-  [DIRECTORY] (entry, done) {
+  [DIRECTORY] (entry, _) {
     const mode = entry.mode & 0o7777 || this.dmode
     const er = this[MKDIR](entry.absolute, mode)
-    if (er) {
-      this[ONERROR](er, entry)
-      done()
-      return
-    }
+    if (er)
+      return this[ONERROR](er, entry)
     if (entry.mtime && !this.noMtime) {
       try {
         fs.utimesSync(entry.absolute, entry.atime || new Date(), entry.mtime)
@@ -821,7 +775,6 @@ class UnpackSync extends Unpack {
         fs.chownSync(entry.absolute, this[UID](entry), this[GID](entry))
       } catch (er) {}
     }
-    done()
     entry.resume()
   }
 
@@ -844,10 +797,9 @@ class UnpackSync extends Unpack {
     }
   }
 
-  [LINK] (entry, linkpath, link, done) {
+  [LINK] (entry, linkpath, link, _) {
     try {
       fs[link + 'Sync'](linkpath, entry.absolute)
-      done()
       entry.resume()
     } catch (er) {
       return this[ONERROR](er, entry)
